@@ -1,18 +1,31 @@
+######################################
+##  Code to read MS sprat sampling  ##
+##  data and process into FLStock   ##
+##########################nc.03.21####
 
-## Sprat APHIA ID = 126425
 rm(list=ls())
-#!/usr/bin/env Rscript
 setwd("C:/Work/WoS_SPRAT")
 
-aphia.code <- 126425
 
+## libraries
 
-library(FLCore)
-library(readxl)
+library("FLCore")
+library("readxl")
+library("ggplot2")
+library("sf")
+library("rnaturalearth")
+library("rnaturalearthhires")
+library("scales")
+library("dplyr")
 
-data.files <- list.files("data")
+## read landings
 
 landings <- read.csv("sprat landings.csv")
+
+
+## read in sampling
+
+data.files <- list.files("data")
 
 wos.spr <- FLStock()
 
@@ -29,33 +42,141 @@ FLQuant(
 )
 
 wos.spr@landings <- FLQuant(as.vector(landings$Landings), units = "Tonnes", dimnames=list(year = c(min(landings$Year):max(landings$Year))))
-?FLQuant
-read<-function(filename){
+
+
+data.files <- paste("Sprat sample data ", c(2012:2017), ".xlsx", sep="")
+
+read<-function(filename, plusgroup = 4){
   cat(c("Loading data from ", filename, ".\n"))
-
-    filename <- data.files[3]
+  
+  sample.data <- read_xlsx(paste("data/",filename, sep=""), sheet = "sample data") 
+  length.data <- read_xlsx(paste("data/",filename, sep=""), sheet = "length data") 
+  bio.data <- read_xlsx(paste("data/",filename, sep=""), sheet = "bio data") 
+  bio.data$ring_age[bio.data$ring_age > plusgroup] <- plusgroup
+  bio.data <- bio.data[!is.na(bio.data$ring_age),]
+  raising.factor <- sample.data %>% 
+    select (`sample_no`, `weight landed (kg)`, `weight sampled (kg)`) %>%
+    mutate( raising_factor = `weight landed (kg)`/`weight sampled (kg)`)
+  
+  length.data <- left_join(length.data, raising.factor, by = NULL)
+  
+  
+  length.data <- 
+    length.data %>%
+    mutate(raised_no = number * raising_factor)
+  
+  
+  # raise catches
+  
+  raised.catch.at.length <- 
+    length.data %>% 
+    group_by(lngt_cm) %>%
+    summarise(total = sum(raised_no))
+  
+  ## plot to check things look ok
+  
+  lenfreq1 <- 
+    ggplot(data = raised.catch.at.length) + 
+    geom_col(aes(x=lngt_cm,y= total))+
+    scale_x_discrete(name = "Length (cm)") +
+    scale_y_continuous(name = "Raised Number")
+  lenfreq1
+  
+  
+  n.at.length <- bio.data %>%
+    group_by(lngt_cm) %>%
+    summarise(n = n())
+  
+  n.at.age <- bio.data %>%
+    group_by(lngt_cm, ring_age) %>%
+    summarise(n = n())
+  
+  
+  n.at.age <- left_join(n.at.age, n.at.length, by = "lngt_cm")
+  
+  n.at.age$prop.at.l <- n.at.age$n.x/n.at.age$n.y
+  
+  n.at.age <- left_join(n.at.age, raised.catch.at.length, by = "lngt_cm")
+  
+  n.at.age$no.age.at.l <- n.at.age$prop.at.l * n.at.age$total
+  
+  lw.a <- 0.0059
+  lw.b <- 3.1088
+  
+  ## length weight params from Ellis et al. 2013.
+  ## Science Series Technical Report, CEFAS, 150: 109 pp.
+  ## https://www.researchgate.net/publication/316090368_Length-weight_relationships_of_marine_fish_collected_from_around_the_British_Isles/figures?lo=1
+  ## update these if we have better from sampling...?
+  
+  n.at.age$wt_gr <- lw.a * n.at.age$lngt_cm^lw.b
+  
+  n.at.age$wt.age.l <- (n.at.age$wt_gr * n.at.age$no.age.at.l)/1000000
+  
+  sampled.catch <- 
     
-    sample.data <- read_xlsx(paste("data/",filename, sep=""), sheet = "sample data") 
-    length.data <- read_xlsx(paste("data/",filename, sep=""), sheet = "length data") 
-       bio.data <- read_xlsx(paste("data/",filename, sep=""), sheet = "bio data") 
+    n.at.age %>%
+    group_by(ring_age) %>%
+    summarise(cat.n = sum(no.age.at.l), cat = sum(wt.age.l))
+  
+  total.catch <- sampled.catch
+  
+  total.catch$cat.n <- (total.catch$cat.n * (landings$Landings[landings$Year == as.numeric(substr(filename, 19, 22))]/sum(sample.data$`weight landed (kg)`/1000)))/1000
+  total.catch$cat <- total.catch$cat * (landings$Landings[landings$Year == as.numeric(substr(filename, 19, 22))]/sum(sample.data$`weight landed (kg)`/1000))
+  
+  return(total.catch)
+  
+}
 
-       raising.factor <- sample.data %>% 
-         select (`sample_no`, `weight landed (kg)`, `weight sampled (kg)`) %>%
-         mutate( raising_factor = `weight landed (kg)`/`weight sampled (kg)`)
-       
-       length.data <- left_join(length.data, raising.factor, by = NULL)
-       
+wos.cat <- wos.cat.n <- NULL
 
-      length.data <- 
-        length.data %>%
-         mutate(raised_no = number * raising_factor)
-       
+wos.cat.n <- cbind(wos.cat.n, total.catch$cat.n)
+wos.cat <- cbind(wos.cat, total.catch$cat)
+
+
+for(i in (1:length(data.files))){
+  
+  temp <-  read(data.files[i])
+  
+  wos.cat <- cbind(wos.cat, temp$cat)
+  wos.cat.n <- cbind(wos.cat.n, temp$cat.n)
+  
 }
 
 
 
+#  wos.spr@catch <- 
+
+FLQuant(
+  dim = c(5, 59, 1, 1, 1, 1),
+  dimnames = list(quant = "Age", year = 1961:2017),
+  quant = NULL,
+  units = "t",
+  iter = 1,
+  fill.iter = TRUE
+)
+
+
+wos.spr@catch.n <- 
+  
+  FLQuant(
+    landings$Landings,
+    dim = c(5, 6, 1, 1, 1, 1),
+    dimnames = list(quant = "Age", year = 2012:2017),
+    quant = NULL,
+    units = "thousands",
+    iter = 1,
+    fill.iter = TRUE
+  )
+
+
+
+ass <- read(data.files[1])
 
 ### SPRAT SURVEY MAPS  ###
+
+## Sprat APHIA ID = 126425
+aphia.code <- 126425
+
 
 coast <- read.csv("C:/Work/europe_coast.csv")
 
@@ -77,12 +198,7 @@ hh$SPR[match(names(temp), hh$unique.id)] <- temp
 hh$SPR.cpue <- hh$SPR * (60/hh$HaulDur)
 
 
-library("ggplot2")
 theme_set(theme_bw())
-library("sf")
-library("rnaturalearth")
-library("rnaturalearthhires")
-library("scales")
 
 
 world <- ne_countries(scale = "large", returnclass = "sf")
