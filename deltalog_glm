@@ -1,0 +1,189 @@
+rm(list=ls())
+
+library(icesDatras)
+library(fishMod)
+library(mgcv)
+
+year.range <- 2009:2020
+## We going to use 2015-2020, or 2009 - 2017
+
+
+gur <- 126425
+
+### CHANGED TO THE APHIA ID OF SPRAT BUT STILL CALLED "gur" TO MAKE LIFE SIMPLE!
+
+## Surveys we want are;
+#   NS-IBTS 2009 - 2020. Q1 & Q3 (think the Norwegians are in Q2, but maybe we could exlude 4a?)
+
+
+
+survey.list <- c("NS-IBTS", "NS-IBTS")
+survey.quarters <- c(1, 3)
+start.year <- c(2009, 2009)
+end.year   <- c(2020, 2020)
+year.range <- c(2009:2020)
+
+
+survey.availability <- data.frame(survey.name = survey.list, quarter = survey.quarters, start = start.year, end = end.year)
+
+
+### Length-weight relationship
+#   From ellis et al
+
+ length.a <- 0.0018
+ length.b <- 2.5943
+
+ haul.data <- length.data <- NULL
+
+ for (i in (1:length(year.range))){
+
+   temp.year <- year.range[i]
+
+  for(j in (1:dim(survey.availability))){
+
+  if(survey.availability$quarter[j] %in% getSurveyYearQuarterList(survey.availability$survey.name[j], temp.year) == FALSE){next}
+
+
+    temp.hl <- getHLdata(survey.availability$survey.name[j], year = temp.year, quarter = survey.availability$quarter[j])
+    temp.hh <- getHHdata(survey.availability$survey.name[j], year = temp.year, quarter = survey.availability$quarter[j])
+
+#   if(150662 %in% temp.hl$Valid_Aphia == TRUE){print("uh-oh! synonym used in data")}
+
+    temp.hl <- temp.hl[temp.hl$Valid_Aphia == gur,]
+
+    haul.data <- rbind(haul.data, temp.hh)
+    length.data <- rbind(length.data, temp.hl)
+
+   }
+
+  }
+
+ length.data <- length.data[!is.na(length.data$LngtClass),]
+## there are some invalid rows
+
+ length.data$LngtClass[length.data$LngtClass<20] <- length.data$LngtClass[length.data$LngtClass<20]*10
+## and one haul is measured in cm for some reason
+
+ length.data$LngtClass <- length.data$LngtClass/10
+##but on reflection, we want it in cm, so the LW relationship gives us catches in the correct units
+ length.data$wtClass <- round(length.a * (length.data$LngtClass ^ length.b), 0)/1000
+## calculate weights
+
+length.data$TotalWt <- length.data$wtClass * length.data$HLNoAtLngt
+## multinply by no at length
+
+haul.data <- haul.data[haul.data$HaulVal == "V",]
+## lose the invalid hauls
+
+
+ head(haul.data)
+
+ haul.data$unique.id <- paste(haul.data$Survey, haul.data$Year, haul.data$Quarter, haul.data$HaulNo, sep = "-")
+ length.data$unique.id <- paste(length.data$Survey, length.data$Year, length.data$Quarter, length.data$HaulNo, sep ="-")
+
+ haul.weights <- tapply(length.data$TotalWt, length.data$unique.id, sum)
+
+ haul.data$kg.gur <- NA
+
+ for(i in (1:length(haul.weights))){
+    haul.data$kg.gur[match(names(haul.weights)[i], haul.data$unique.id)] <- haul.weights[i] 
+ }
+
+haul.data$kg.gur[is.na(haul.data$kg.gur)] <- 0
+
+haul.data$st.kg.gur <- haul.data$kg.gur * (60/haul.data$HaulDur)
+
+
+haul.data   <- haul.data[!is.na(haul.data$Depth),] ## 17 data points have no depth associated. Chosen to remove these
+
+
+haul.data   <- read.csv("C:/Work/WKWEST/Data/haul_data.csv")
+length.data <- read.csv("C:/Work/WKWEST/Data/length_data.csv")
+
+
+
+
+library(icesTAF)
+library(fishMod)
+
+mkdir("data")
+
+
+
+# read in data
+gur.dat <- read.taf(taf.data.path("gurnard_survey_datras_data.csv"))
+sim.data <- read.taf(taf.data.path("sim_data.csv"))
+
+
+# utilities for factors
+makeFactor <- function(x, fullx, what) {
+  factor(x[[what]], levels = levels(factor(fullx[[what]])))
+}
+
+data_factored <-
+  function(dat, full_dat = dat) {
+    data.frame(
+      fYear = makeFactor(dat, full_dat, "Year"),
+      fQuarter = makeFactor(dat, full_dat, "Quarter"),
+      fSurvey = makeFactor(dat, full_dat, "Survey"),
+      HaulLat = dat$HaulLat,
+      HaulLong = dat$HaulLong,
+      Depth = dat$Depth
+    )
+  }
+
+# utility for preduiction
+makePrediction <- function(mod, lnForm, binForm, newdata) {
+  # get model matrices
+  lnX <- model.matrix(lnForm[-2], newdata)
+  binX <- model.matrix(binForm, newdata)
+  
+  # get coefs
+  lnb <- coef(mod$lnMod)
+  binb <- coef(mod$binMod)
+  
+  # get vcov matrix
+  lnV <- vcov(mod$lnMod)
+  binV <- vcov(mod$binMod)
+  
+  # predictions (on link scale)
+  newdata$lnpred <- c(lnX %*% lnb)
+  newdata$binpred <- c(binX %*% binb)
+  
+  # standard errors
+  newdata$lnpred.se <- sqrt(diag(lnX %*% lnV %*% t(lnX)))
+  newdata$binpred.se <- sqrt(diag(binX %*% binV %*% t(binX)))
+  
+  # combine
+  binFitted <- binomial()$linkinv(newdata$binpred)
+  
+  stderr_resids <- summary(mod$lnMod)$sigma
+  newdata$pred <-
+    exp(newdata$lnpred + 0.5 * stderr_resids^2) * binFitted
+  newdata$pred.se <-
+    sqrt(
+      binFitted * exp(2 * newdata$lnpred + stderr_resids^2) * (exp(stderr_resids^2) - binFitted)
+    )
+  
+  newdata
+}
+
+
+# set upfactors (needed for predicting)
+mod.dat <- cbind(data_factored(haul.data), st.kg.gur = haul.data$st.kg.gur)
+
+# set up model
+lnForm <-
+  st.kg.gur ~ fYear + fQuarter + HaulLat + Depth
+
+binForm <- ~ fQuarter + HaulLong + Depth
+
+# fit
+gur.mod <- deltaLN(lnForm, binForm, data = mod.dat)
+
+
+
+# predict
+newdata <- data_factored(sim.data, gur.dat)
+preds <- makePrediction(gur.mod, lnForm, binForm, newdata)
+preds
